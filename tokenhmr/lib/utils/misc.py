@@ -8,8 +8,16 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Callable, List
 
-import hydra
-from omegaconf import DictConfig, OmegaConf
+try:
+    import hydra  # type: ignore
+    from omegaconf import DictConfig, OmegaConf  # type: ignore
+    HYDRA_AVAILABLE = True
+except Exception:  # pragma: no cover - optional dependency
+    hydra = None
+    DictConfig = object  # type: ignore
+    OmegaConf = None  # type: ignore
+    HYDRA_AVAILABLE = False
+
 from pytorch_lightning import Callback
 from pytorch_lightning.loggers import Logger
 from pytorch_lightning.utilities import rank_zero_only
@@ -104,6 +112,10 @@ def instantiate_callbacks(callbacks_cfg: DictConfig) -> List[Callback]:
     """Instantiates callbacks from config."""
     callbacks: List[Callback] = []
 
+    if not HYDRA_AVAILABLE:
+        log.warning("Hydra not available, callbacks will not be instantiated.")
+        return []
+
     if not callbacks_cfg:
         log.warning("Callbacks config is empty.")
         return callbacks
@@ -122,6 +134,10 @@ def instantiate_callbacks(callbacks_cfg: DictConfig) -> List[Callback]:
 def instantiate_loggers(logger_cfg: DictConfig) -> List[Logger]:
     """Instantiates loggers from config."""
     logger: List[Logger] = []
+
+    if not HYDRA_AVAILABLE:
+        log.warning("Hydra not available, loggers will not be instantiated.")
+        return []
 
     if not logger_cfg:
         log.warning("Logger config is empty.")
