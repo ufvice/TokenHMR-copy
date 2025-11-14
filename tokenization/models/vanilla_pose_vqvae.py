@@ -315,7 +315,13 @@ class DecodeTokens(nn.Module):
         super(DecodeTokens, self).__init__()
         
         num_joints = 21
-        ckpt = torch.load(ckpt_path, map_location='cpu')
+        # PyTorch>=2.6 默认使用 weights_only=True，会禁止反序列化包含 yacs.CfgNode
+        # 这里显式设置为 False，并对早期没有该参数的版本做兼容处理
+        try:
+            ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+        except TypeError:
+            # 旧版 PyTorch 不支持 weights_only 参数
+            ckpt = torch.load(ckpt_path, map_location='cpu')
         pretrained_hparams = ckpt['hparams']
         arch = pretrained_hparams.ARCH
         rot_type = arch.ROT_TYPE
