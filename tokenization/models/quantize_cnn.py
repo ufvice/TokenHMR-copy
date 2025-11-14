@@ -15,7 +15,8 @@ class QuantizeEMAReset(nn.Module):
         self.init = False
         self.code_sum = None
         self.code_count = None
-        self.register_buffer('codebook', torch.zeros(self.nb_code, self.code_dim).cuda())
+        # 初始 codebook 放在当前模块默认设备上，后续由 model.to(device) 统一迁移
+        self.register_buffer('codebook', torch.zeros(self.nb_code, self.code_dim))
 
     def _tile(self, x):
         nb_code_x, code_dim = x.shape
