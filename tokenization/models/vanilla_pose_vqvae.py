@@ -6,15 +6,40 @@ import torch.nn.functional as F
 from collections import OrderedDict
 from .resnet import Resnet1D
 from .quantize_cnn import QuantizeEMAReset
-from .rotation_utils import matrix_to_rotation_6d, rotation_6d_to_matrix, matrix_to_axis_angle
-from smplx import SMPLHLayer, SMPLXLayer
+from .rotation_utils import (
+    matrix_to_rotation_6d,
+    rotation_6d_to_matrix,
+    matrix_to_axis_angle,
+)
 
-smpl_type='smplh'
+# NOTE:
+# 原始实现这里会在导入时强制依赖 smplx 并实例化 SMPLH/SMPLX 模型，
+# 仅在 mesh_inference=True 时才真正使用。
+# 为了支持“只做关节旋转/形状/相机参数推理、不安装 smplx”的场景，
+# 将 smplx 视为可选依赖：导入失败时关闭 mesh 推理分支。
+try:  # pragma: no cover - 可选依赖
+    from smplx import SMPLHLayer, SMPLXLayer  # type: ignore
+
+    _SMPLX_AVAILABLE = True
+except Exception:  # pragma: no cover - 纯参数推理时允许缺失
+    SMPLHLayer = SMPLXLayer = None  # type: ignore
+    _SMPLX_AVAILABLE = False
+
 import os
+
+smpl_type = "smplh"
 current_dir = os.path.dirname(os.path.realpath(__file__))
-body_model_path = os.path.join(current_dir, '..', '..', 'data/body_models', smpl_type)
-body_model = eval(f'{smpl_type.upper()}Layer')(body_model_path, num_betas=10, ext='pkl')
-body_model = body_model.cuda() if torch.cuda.is_available() else body_model
+body_model_path = os.path.join(current_dir, "..", "..", "data/body_models", smpl_type)
+
+# 仅在 smplx 可用时构建 body_model；否则保持为 None，并在下游根据
+# mesh_inference 标志控制是否访问它。
+if _SMPLX_AVAILABLE:
+    body_model = eval(f"{smpl_type.upper()}Layer")(
+        body_model_path, num_betas=10, ext="pkl"
+    )
+    body_model = body_model.cuda() if torch.cuda.is_available() else body_model
+else:
+    body_model = None
 
 def step_multiplier_mapping():
     return {
@@ -136,6 +161,14 @@ class PoseSPDecoderV1(nn.Module):
         decoder_layers = []
         self.rot_type = rot_type
         self.num_joints = num_joints
+
+        # 如果环境中没有 smplx，则即便外部传入 mesh_inference=True，
+        # 也自动关闭网格推理，只保留关节姿态预测功能。
+        if mesh_inference and not _SMPLX_AVAILABLE:
+            print(
+                "[vanilla_pose_vqvae] smplx 未安装，mesh_inference 已自动关闭，仅输出关节姿态参数。"
+            )
+            mesh_inference = False
         self.mesh_inference = mesh_inference
         self.out_postprocess = out_postprocess
 
@@ -187,6 +220,10 @@ class PoseSPDecoderV1(nn.Module):
         })
         
         if self.mesh_inference:
+            if body_model is None:
+                raise RuntimeError(
+                    "mesh_inference=True 但未成功构建 body_model（可能缺少 smplx）。"
+                )
             pred_pose_aa = matrix_to_axis_angle(pred_pose_rotmat.view(-1, 3, 3)).view(batch_size, 3*self.num_joints)
             pred_body_mesh = body_model(body_pose=pred_pose_rotmat)
 
