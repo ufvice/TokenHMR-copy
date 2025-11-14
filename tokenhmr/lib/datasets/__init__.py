@@ -11,8 +11,15 @@ from ..configs import to_lower, dataset_eval_config
 from .dataset import Dataset
 from .image_dataset import ImageDataset
 from .mocap_dataset import MoCapDataset
-from .bedlam_dataset_tar import BedlamDataset
-from .emdb_dataset import EMDBDataset
+
+try:
+    # Optional training/eval datasets; absence of their heavy deps
+    # (e.g. SMPL, smplx) should not break lightweight inference code.
+    from .bedlam_dataset_tar import BedlamDataset  # type: ignore
+    from .emdb_dataset import EMDBDataset  # type: ignore
+except Exception:  # pragma: no cover - optional datasets
+    BedlamDataset = None  # type: ignore
+    EMDBDataset = None  # type: ignore
 
 def create_dataset(cfg: CfgNode, dataset_cfg: CfgNode, train: bool = True, **kwargs) -> Dataset:
     """
@@ -93,5 +100,4 @@ class TokenHMRDataModule(pl.LightningDataModule):
         """
         val_dataloader = torch.utils.data.DataLoader(self.val_dataset, self.cfg.TRAIN.BATCH_SIZE, drop_last=True, num_workers=self.cfg.GENERAL.NUM_WORKERS)
         return val_dataloader
-
 

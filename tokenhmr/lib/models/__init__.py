@@ -1,6 +1,7 @@
-from .tokenhmr import TokenHMR
-
 def load_tokenhmr(checkpoint_path='', model_cfg=f'', dataset_dir='', is_train_state=False, is_demo=False):
+    # Import inside function to avoid pulling heavy dependencies (SMPL, renderers)
+    # when only lightweight utilities or alternative models are used.
+    from .tokenhmr import TokenHMR
     from pathlib import Path
     from ..configs import get_config
     model_cfg = get_config(model_cfg)
