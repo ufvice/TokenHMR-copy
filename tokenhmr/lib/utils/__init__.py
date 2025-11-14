@@ -1,10 +1,18 @@
 import torch
 from typing import Any
 
-from .renderer import Renderer
-from .mesh_renderer import MeshRenderer
-from .skeleton_renderer import SkeletonRenderer
+try:
+    from .renderer import Renderer
+    from .mesh_renderer import MeshRenderer
+    from .skeleton_renderer import SkeletonRenderer
+except Exception:
+    # 渲染相关依赖（如 pyrender、OpenGL）缺失时，仍允许非渲染推理代码正常工作
+    Renderer = None
+    MeshRenderer = None
+    SkeletonRenderer = None
+
 from .pose_utils import eval_pose, Evaluator
+
 
 def recursive_to(x: Any, target: torch.device):
     """
