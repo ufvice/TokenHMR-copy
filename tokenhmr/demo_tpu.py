@@ -195,37 +195,34 @@ def _finalize_sequence(
         data = [rec[key] for rec in records]
         return torch.stack(data, dim=0)
 
-    labels = {
-        "frame_index": torch.tensor(
-            [rec["frame_index"] for rec in records], dtype=torch.long
-        ),
-        "box_center": stack_tensor("box_center"),
-        "box_size": torch.tensor(
-            [rec["box_size"] for rec in records], dtype=torch.float32
-        ),
-        "img_size": stack_tensor("img_size"),
-        "pred_cam": stack_tensor("pred_cam"),
-        "pred_cam_t": stack_tensor("pred_cam_t"),
-        "pred_smpl_params": {
-            "global_orient": stack_tensor("global_orient"),
-            "body_pose": stack_tensor("body_pose"),
-            "betas": stack_tensor("betas"),
-        },
+    # ==================== 修改开始 ====================
+    # 1. 堆叠所有必需的 SMPL 参数张量
+    #    这些参数已经由模型在 main 循环中预测并存储在 records 中
+    global_orient = stack_tensor("global_orient")
+    body_pose = stack_tensor("body_pose")
+    betas = stack_tensor("betas")
+
+    # 我们使用 pred_cam_t 作为 SMPL 的平移 'transl'
+    transl = stack_tensor("pred_cam_t")
+
+    # 2. 构建 smplx_data_c 字典
+    #    这符合我们上一个项目 (GVHMR) 的评估格式
+    smplx_data_c = {
+        "global_orient": global_orient,
+        "body_pose": body_pose,
+        "betas": betas,
+        "transl": transl,
     }
 
-    num_frames = len(records)
-    if extrinsic_template.shape[0] == num_frames:
-        extrinsic = extrinsic_template.clone()
-    elif extrinsic_template.shape[0] == 1:
-        extrinsic = extrinsic_template.repeat(num_frames, 1, 1)
-    else:
-        raise ValueError("外参帧数与视频长度不匹配")
-
-    cameras = {
-        "intrinsic": intrinsic.clone(),
-        "extrinsic": extrinsic,
+    # 3. 以期望的格式返回结果
+    #    这个 TokenHMR 模型似乎只生成一套相机空间参数，
+    #    因此我们将 'smplx_data_c' 和 'smplx_data_w' 都设置为相同的值，
+    #    以确保评估脚本两边都能取到数据。
+    return {
+        "smplx_data_c": smplx_data_c,
+        "smplx_data_w": smplx_data_c.copy(),  # 确保评估器可以访问 _w
     }
-    return {"labels": labels, "cameras": cameras}
+    # ==================== 修改结束 ====================
 
 
 def main():
