@@ -203,16 +203,17 @@ def _finalize_sequence(
     # 1. 堆叠所有必需的 SMPL 参数张量
     #    这些参数已经由模型在 main 循环中预测并存储在 records 中
     global_orient_matrix = stack_tensor("global_orient")  # (T, 1, 3, 3)
-    body_pose_6d = stack_tensor("body_pose")  # (T, 21, 6)
+    body_pose_6d = stack_tensor("body_pose")  # (T, J, 6)
     betas = stack_tensor("betas")  # (T, 10)
 
     # pred_cam_t 直接作为 SMPL 的平移 'transl'
     transl = stack_tensor("pred_cam_t")  # (T, 3)
     T = body_pose_6d.shape[0]
+    J = body_pose_6d.shape[1]
 
     # --- 转换 body_pose: 6D -> 轴角 ---
     body_pose_matrix = rotation_6d_to_matrix(body_pose_6d.view(-1, 6))
-    body_pose_aa = matrix_to_axis_angle(body_pose_matrix).view(T, 21, 3)
+    body_pose_aa = matrix_to_axis_angle(body_pose_matrix).view(T, J, 3)
 
     # --- 转换 global_orient: 3x3 -> 轴角 ---
     global_orient_aa = matrix_to_axis_angle(global_orient_matrix.view(T, 3, 3))
