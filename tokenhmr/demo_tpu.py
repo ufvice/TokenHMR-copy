@@ -129,6 +129,38 @@ def _to_extrinsic(arg: str) -> torch.Tensor:
     return tensor
 
 
+def _rotmat_to_aa(rotmats: torch.Tensor) -> torch.Tensor:
+    """
+    将旋转矩阵转换为轴角表示。
+    输入可以是 (..., 3, 3)，输出为 (..., 3)。
+    """
+    orig_shape = rotmats.shape[:-2]
+    rotmats_flat = rotmats.reshape(-1, 3, 3)
+
+    # 按标准公式从旋转矩阵恢复轴角
+    trace = rotmats_flat[:, 0, 0] + rotmats_flat[:, 1, 1] + rotmats_flat[:, 2, 2]
+    cos_theta = (trace - 1.0) * 0.5
+    cos_theta = torch.clamp(cos_theta, -1.0 + 1e-6, 1.0 - 1e-6)
+    theta = torch.acos(cos_theta)
+
+    sin_theta = torch.sin(theta)
+    kx = (rotmats_flat[:, 2, 1] - rotmats_flat[:, 1, 2]) / (2.0 * sin_theta)
+    ky = (rotmats_flat[:, 0, 2] - rotmats_flat[:, 2, 0]) / (2.0 * sin_theta)
+    kz = (rotmats_flat[:, 1, 0] - rotmats_flat[:, 0, 1]) / (2.0 * sin_theta)
+
+    axis = torch.stack([kx, ky, kz], dim=-1)
+
+    # 对于非常小的旋转角，退化为零向量，避免数值问题
+    small_angle = sin_theta.abs() < 1e-4
+    if small_angle.any():
+        axis[small_angle] = 0.0
+        theta = theta.clone()
+        theta[small_angle] = 0.0
+
+    aa = axis * theta.unsqueeze(-1)
+    return aa.reshape(*orig_shape, 3)
+
+
 def _resolve_device(requested: str) -> Tuple[torch.device, Optional[object]]:
     if requested == "auto":
         if torch.cuda.is_available():
@@ -184,48 +216,55 @@ def _read_video_frames(video_path: Path) -> List:
     return frames
 
 
-def _finalize_sequence(
-    records: List[Dict], intrinsic: torch.Tensor, extrinsic_template: torch.Tensor
+def _finalize_sequence_smplx_like(
+    *,
+    num_frames: int,
+    per_frame_global_orient_aa: torch.Tensor,
+    per_frame_body_pose_aa: torch.Tensor,
+    per_frame_betas: torch.Tensor,
+    per_frame_transl_c: torch.Tensor,
 ) -> Dict:
-    if not records:
-        raise RuntimeError("记录为空")
-    records.sort(key=lambda x: x["frame_index"])
+    """
+    将单个序列整理为 tc3d-eval 期望的预测格式：
+    {seq_name: {'smplx_data_c': {...}, 'smplx_data_w': {...}}}
 
-    def stack_tensor(key: str):
-        data = [rec[key] for rec in records]
-        return torch.stack(data, dim=0)
+    其中 body_pose 采用 21 个 body joints 的轴角展平后形状 [T,63]。
+    """
+    if num_frames == 0:
+        raise RuntimeError("序列帧数不能为0")
 
-    labels = {
-        "frame_index": torch.tensor(
-            [rec["frame_index"] for rec in records], dtype=torch.long
-        ),
-        "box_center": stack_tensor("box_center"),
-        "box_size": torch.tensor(
-            [rec["box_size"] for rec in records], dtype=torch.float32
-        ),
-        "img_size": stack_tensor("img_size"),
-        "pred_cam": stack_tensor("pred_cam"),
-        "pred_cam_t": stack_tensor("pred_cam_t"),
-        "pred_smpl_params": {
-            "global_orient": stack_tensor("global_orient"),
-            "body_pose": stack_tensor("body_pose"),
-            "betas": stack_tensor("betas"),
-        },
+    # 仅保留前 21 个 body joints，对应 63 维轴角
+    if per_frame_body_pose_aa.ndim != 3:
+        raise ValueError("per_frame_body_pose_aa 期望形状为[T, J, 3]")
+    body_joints = per_frame_body_pose_aa.shape[1]
+    target_joints = 21
+    if body_joints < target_joints:
+        raise ValueError(
+            f"SMPL 关节数不足，期望至少 {target_joints} 个，实际为 {body_joints}"
+        )
+
+    body_pose_21 = per_frame_body_pose_aa[:, :target_joints, :]  # [T,21,3]
+    body_pose_flat = body_pose_21.reshape(num_frames, target_joints * 3)  # [T,63]
+
+    smplx_data_c = {
+        "body_pose": body_pose_flat.clone(),
+        "betas": per_frame_betas.clone(),
+        "global_orient": per_frame_global_orient_aa.clone(),
+        "transl": per_frame_transl_c.clone(),
     }
 
-    num_frames = len(records)
-    if extrinsic_template.shape[0] == num_frames:
-        extrinsic = extrinsic_template.clone()
-    elif extrinsic_template.shape[0] == 1:
-        extrinsic = extrinsic_template.repeat(num_frames, 1, 1)
-    else:
-        raise ValueError("外参帧数与视频长度不匹配")
-
-    cameras = {
-        "intrinsic": intrinsic.clone(),
-        "extrinsic": extrinsic,
+    # 当前没有精确的 world 坐标外参信息，先直接复制一份用于全局指标计算
+    smplx_data_w = {
+        "body_pose": body_pose_flat.clone(),
+        "betas": per_frame_betas.clone(),
+        "global_orient": per_frame_global_orient_aa.clone(),
+        "transl": per_frame_transl_c.clone(),
     }
-    return {"labels": labels, "cameras": cameras}
+
+    return {
+        "smplx_data_c": smplx_data_c,
+        "smplx_data_w": smplx_data_w,
+    }
 
 
 def main():
@@ -281,12 +320,46 @@ def main():
             )
             frames = frames[:min_len]
             boxes = boxes[:min_len]
+            frame_count = min_len
+
+        # 1) 根据 bbox 过滤掉全 0 的帧，这些帧视为“无人”，不做模型推理
+        if boxes.ndim != 2 or boxes.shape[1] != 4:
+            raise ValueError(f"序列{key}的bbox形状异常，期望[T,4]，实际为{boxes.shape}")
+        zero_mask = np.all(boxes == 0.0, axis=1)
+        valid_mask = ~zero_mask
+        valid_indices = np.nonzero(valid_mask)[0]
+
+        # 为整个序列预先分配 SMPLX 参数缓存（在 CPU 上）
+        num_frames = frame_count
+        target_joints = 21
+        betas_dim = 10
+        per_frame_global_orient_aa = torch.zeros((num_frames, 3), dtype=torch.float32)
+        per_frame_body_pose_aa = torch.zeros(
+            (num_frames, target_joints, 3), dtype=torch.float32
+        )
+        per_frame_betas = torch.zeros((num_frames, betas_dim), dtype=torch.float32)
+        per_frame_transl_c = torch.zeros((num_frames, 3), dtype=torch.float32)
+
+        if valid_indices.size == 0:
+            # 整个序列都无人：直接写入全 0 姿态，占位以通过评估流程
+            print(f"[提示] 序列{key}所有bbox为0，跳过模型推理，仅输出占位姿态")
+            results[key] = _finalize_sequence_smplx_like(
+                num_frames=num_frames,
+                per_frame_global_orient_aa=per_frame_global_orient_aa,
+                per_frame_body_pose_aa=per_frame_body_pose_aa,
+                per_frame_betas=per_frame_betas,
+                per_frame_transl_c=per_frame_transl_c,
+            )
+            continue
+
+        frames_valid = [frames[i] for i in valid_indices]
+        boxes_valid = boxes[valid_indices]
 
         dataset = ViTDetDatasetTPU(
             model_cfg,
-            frames=frames,
-            boxes=boxes,
-            frame_indices=range(len(frames)),
+            frames=frames_valid,
+            boxes=boxes_valid,
+            frame_indices=valid_indices,
             sequence_id=key,
         )
         dataloader = torch.utils.data.DataLoader(
@@ -297,7 +370,6 @@ def main():
             pin_memory=False,
         )
 
-        seq_records: List[Dict] = []
         for batch in dataloader:
             imgs = batch["img"].to(device)
             batch_meta = {k: v for k, v in batch.items() if k != "img"}
@@ -307,27 +379,43 @@ def main():
                 xm.mark_step()
 
             smpl_params = out["pred_smpl_params"]
-            global_orient = smpl_params["global_orient"].detach().cpu()
-            body_pose = smpl_params["body_pose"].detach().cpu()
-            betas = smpl_params["betas"].detach().cpu()
-            pred_cam = out["pred_cam"].detach().cpu()
-            pred_cam_t = out["pred_cam_t"].detach().cpu()
+            global_orient = smpl_params["global_orient"].detach().cpu()  # [B,1,3,3]
+            body_pose = smpl_params["body_pose"].detach().cpu()  # [B,J,3,3]
+            betas = smpl_params["betas"].detach().cpu()  # [B,10]
+            pred_cam_t = out["pred_cam_t"].detach().cpu()  # [B,3]
 
-            for idx in range(global_orient.shape[0]):
-                record = {
-                    "frame_index": int(batch_meta["frame_index"][idx]),
-                    "box_center": batch_meta["box_center"][idx].detach().cpu(),
-                    "box_size": float(batch_meta["box_size"][idx]),
-                    "img_size": batch_meta["img_size"][idx].detach().cpu(),
-                    "global_orient": global_orient[idx],
-                    "body_pose": body_pose[idx],
-                    "betas": betas[idx],
-                    "pred_cam": pred_cam[idx],
-                    "pred_cam_t": pred_cam_t[idx],
-                }
-                seq_records.append(record)
+            # 将旋转矩阵转为轴角，并裁剪为前 21 个 body joints
+            B = global_orient.shape[0]
+            go_mat = global_orient[:, 0]  # [B,3,3]
+            go_aa = _rotmat_to_aa(go_mat)  # [B,3]
 
-        results[key] = _finalize_sequence(seq_records, intrinsic, extrinsic_template)
+            J = body_pose.shape[1]
+            body_pose_mat = body_pose.view(B * J, 3, 3)
+            body_pose_aa_all = _rotmat_to_aa(body_pose_mat).view(B, J, 3)
+            if J < target_joints:
+                raise ValueError(
+                    f"SMPL body joints 数不足，期望至少 {target_joints}，实际为 {J}"
+                )
+            body_pose_aa_21 = body_pose_aa_all[:, :target_joints, :]  # [B,21,3]
+
+            for i in range(B):
+                frame_index = int(batch_meta["frame_index"][i])
+                if frame_index < 0 or frame_index >= num_frames:
+                    raise IndexError(
+                        f"frame_index 超出范围: {frame_index} / {num_frames}"
+                    )
+                per_frame_global_orient_aa[frame_index] = go_aa[i]
+                per_frame_body_pose_aa[frame_index] = body_pose_aa_21[i]
+                per_frame_betas[frame_index] = betas[i]
+                per_frame_transl_c[frame_index] = pred_cam_t[i]
+
+        results[key] = _finalize_sequence_smplx_like(
+            num_frames=num_frames,
+            per_frame_global_orient_aa=per_frame_global_orient_aa,
+            per_frame_body_pose_aa=per_frame_body_pose_aa,
+            per_frame_betas=per_frame_betas,
+            per_frame_transl_c=per_frame_transl_c,
+        )
 
     torch.save(results, output_path)
     print(f"已保存推理结果到 {output_path}")
